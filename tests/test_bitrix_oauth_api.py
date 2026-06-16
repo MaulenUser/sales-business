@@ -109,6 +109,7 @@ def test_sales_audit_frontend_report_uses_stored_portal(tmp_path, monkeypatch):
             {
                 "deal_id": "777",
                 "deal_url": "https://sapaplast.bitrix24.kz/crm/deal/details/777/",
+                "deal_stage_semantic_id": "P",
             }
         ],
     }

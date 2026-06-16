@@ -116,16 +116,63 @@ def build_interaction_index(
     deal_index = deal_index or {}
     manager_names = manager_names or {}
     rows = [
-        _interaction_row(
-            feature,
-            deal_index=deal_index,
-            portal_base_url=portal_base_url,
-            manager_names=manager_names,
+        row
+        for row in (
+            _interaction_row(
+                feature,
+                deal_index=deal_index,
+                portal_base_url=portal_base_url,
+                manager_names=manager_names,
+            )
+            for feature in features
+            if isinstance(feature, dict)
         )
-        for feature in features
-        if isinstance(feature, dict)
+        if _is_in_work_deal(row)
     ]
     return sorted(rows, key=lambda row: _timestamp(row.get("created_at")), reverse=True)
+
+
+def filter_frontend_sales_audit_in_work_sections(report: dict[str, Any]) -> dict[str, Any]:
+    """Limit WhatsApp, calls, and urgent frontend sections to deals still in work."""
+    if not isinstance(report, dict):
+        return report
+
+    filtered = dict(report)
+    interactions = [
+        row
+        for row in filtered.get("interaction_index") or []
+        if isinstance(row, dict) and _is_in_work_deal(row)
+    ]
+    active_ids = {_clean(row.get("deal_id")) for row in interactions if _clean(row.get("deal_id"))}
+    active_ids.update(
+        _clean(row.get("deal_id") or row.get("id"))
+        for row in _task_deal_rows(filtered)
+        if _clean(row.get("deal_id") or row.get("id"))
+    )
+
+    alerts = [
+        row
+        for row in filtered.get("urgent_alerts") or []
+        if isinstance(row, dict)
+        and (_is_in_work_deal(row) or _clean(row.get("deal_id")) in active_ids)
+    ]
+
+    filtered["interaction_index"] = interactions
+    filtered["whatsapp_interactions"] = [
+        row for row in interactions if row.get("channel") == "whatsapp"
+    ]
+    filtered["call_interactions"] = [
+        row for row in interactions if row.get("channel") == "call"
+    ]
+    filtered["urgent_alerts"] = alerts
+
+    dashboard = filtered.get("alerts_dashboard")
+    if isinstance(dashboard, dict):
+        filtered["alerts_dashboard"] = {
+            **dashboard,
+            "rows": alerts,
+        }
+    return filtered
 
 
 def enrich_frontend_manager_names(report: dict[str, Any]) -> dict[str, Any]:
@@ -188,7 +235,7 @@ def build_urgent_alerts(
     grouped: dict[str, dict[str, Any]] = {}
 
     for row in interactions:
-        if not _is_active_deal(row):
+        if not _is_urgent_candidate(row):
             continue
         triggers = _interaction_triggers(row)
         if not triggers:
@@ -203,6 +250,9 @@ def build_urgent_alerts(
         deal_id = _clean(task_row.get("deal_id") or task_row.get("id"))
         if not deal_id:
             continue
+        indexed = deal_index.get(deal_id, {})
+        if indexed and not _is_in_work_deal(indexed):
+            continue
         triggers = []
         active_count = _int(task_row.get("active_task_count") or task_row.get("open_task_count"))
         overdue_count = _int(task_row.get("overdue_task_count") or task_row.get("overdue_tasks"))
@@ -212,7 +262,6 @@ def build_urgent_alerts(
             triggers.append(_trigger("overdue_task", f"В сделке просроченных задач: {overdue_count}."))
         if not triggers:
             continue
-        indexed = deal_index.get(deal_id, {})
         base = {
             "id": deal_id,
             "deal_id": deal_id,
@@ -221,6 +270,11 @@ def build_urgent_alerts(
             "manager_id": _clean(indexed.get("manager_id") or task_row.get("manager_id")),
             "manager_label": indexed.get("manager_name") or task_row.get("manager_name") or _manager_label(task_row.get("manager_id")),
             "created_at": indexed.get("created_at") or task_row.get("created_at") or "",
+            "deal_stage_id": indexed.get("stage_id") or "",
+            "deal_stage_name": indexed.get("stage_name") or "",
+            "deal_stage_semantic_id": indexed.get("stage_semantic_id") or "",
+            "active_as_of_to": indexed.get("active_as_of_to"),
+            "status_bucket": indexed.get("status_bucket") or "",
         }
         _merge_alert(grouped, base, triggers)
 
@@ -267,9 +321,11 @@ def _interaction_row(
         "deal_title": deal.get("deal_title") or (f"Сделка #{deal_id}" if deal_id else ""),
         "deal_url": deal.get("deal_url") or _deal_url(deal_id, portal_base_url),
         "crm_url": deal.get("deal_url") or _deal_url(deal_id, portal_base_url),
-        "deal_stage_id": deal.get("stage_id") or "",
-        "deal_stage_name": deal.get("stage_name") or "",
-        "deal_stage_semantic_id": deal.get("stage_semantic_id") or "",
+        "deal_stage_id": deal.get("stage_id") or _clean(source.get("stage_id")) or "",
+        "deal_stage_name": deal.get("stage_name") or _clean(source.get("stage_name")) or "",
+        "deal_stage_semantic_id": deal.get("stage_semantic_id") or _clean(source.get("stage_semantic_id")) or "",
+        "active_as_of_to": deal.get("active_as_of_to", source.get("active_as_of_to")),
+        "status_bucket": deal.get("status_bucket") or _clean(source.get("status_bucket")) or "",
         "summary": _clean(feature.get("summary")),
         "primary_topic": _primary_topic(feature, tags),
         "client_request": _client_request(feature),
@@ -344,6 +400,11 @@ def _alert_base(
         "manager_id": _clean(row.get("manager_id")),
         "manager_label": row.get("manager_name") or _manager_label(row.get("manager_id")),
         "created_at": row.get("created_at") or "",
+        "deal_stage_id": indexed.get("stage_id") or row.get("deal_stage_id") or "",
+        "deal_stage_name": indexed.get("stage_name") or row.get("deal_stage_name") or "",
+        "deal_stage_semantic_id": indexed.get("stage_semantic_id") or row.get("deal_stage_semantic_id") or "",
+        "active_as_of_to": indexed.get("active_as_of_to", row.get("active_as_of_to")),
+        "status_bucket": indexed.get("status_bucket") or row.get("status_bucket") or "",
     }
 
 
@@ -450,6 +511,9 @@ def _normalize_deal(
         "stage_id": _clean(row.get("STAGE_ID") or row.get("stage_id")),
         "stage_name": _clean(row.get("stage_name") or row.get("STAGE_NAME")),
         "stage_semantic_id": _clean(row.get("STAGE_SEMANTIC_ID") or row.get("stage_semantic_id")),
+        "active_as_of_to": row.get("active_as_of_to") if row.get("active_as_of_to") is not None else row.get("ACTIVE_AS_OF_TO"),
+        "status_bucket": _clean(row.get("status_bucket") or row.get("STATUS_BUCKET")),
+        "closed": _clean(row.get("CLOSED") or row.get("closed")),
         "created_at": _clean(row.get("DATE_CREATE") or row.get("date_create") or row.get("created_at")),
     }
 
@@ -508,11 +572,34 @@ def _has_next_step(feature: dict[str, Any]) -> bool:
     )
 
 
-def _is_active_deal(row: dict[str, Any]) -> bool:
+def _is_urgent_candidate(row: dict[str, Any]) -> bool:
     if row.get("non_sales_interaction"):
         return False
-    semantic = str(row.get("deal_stage_semantic_id") or "").upper()
-    return semantic not in {"S", "F"}
+    return _is_in_work_deal(row)
+
+
+def _is_in_work_deal(row: dict[str, Any]) -> bool:
+    semantic = str(
+        row.get("deal_stage_semantic_id")
+        or row.get("stage_semantic_id")
+        or row.get("STAGE_SEMANTIC_ID")
+        or ""
+    ).strip().upper()
+    if semantic:
+        return semantic == "P"
+
+    bucket = str(row.get("status_bucket") or row.get("STATUS_BUCKET") or "").strip().lower()
+    if bucket:
+        return bucket == "in_work"
+
+    active = _maybe_bool(row.get("active_as_of_to", row.get("ACTIVE_AS_OF_TO")))
+    if active is not None:
+        return active
+
+    closed = str(row.get("closed") or row.get("CLOSED") or "").strip().upper()
+    if closed:
+        return closed == "N"
+    return False
 
 
 def _is_working_time(value: Any) -> bool:
@@ -711,6 +798,21 @@ def _num(value: Any) -> float:
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _maybe_bool(value: Any) -> bool | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "n"}:
+        return False
+    return None
 
 
 def _optional_num(value: Any) -> float | None:

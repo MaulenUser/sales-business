@@ -64,6 +64,7 @@ from ..application.sales_audit import (
     build_sales_audit_report,
     enrich_frontend_deal_urls,
     enrich_frontend_manager_names,
+    filter_frontend_sales_audit_in_work_sections,
 )
 from ..application.sales_quality import AnalyzeSalesQualityRequest, AnalyzeSalesQualityService
 from ..application.transcribe import TranscribeRecordingsRequest, TranscribeRecordingsService
@@ -1634,6 +1635,7 @@ def _get_sales_audit_report_payload(tenant_id: str, run_id: str | None = None) -
 
 def _prepare_sales_audit_report_for_frontend(tenant_id: str, report: dict[str, Any]) -> dict[str, Any]:
     report = enrich_frontend_manager_names(report)
+    report = filter_frontend_sales_audit_in_work_sections(report)
     portal_base_url = ""
     sources = report.get("sales_audit_sources") if isinstance(report, dict) else {}
     if isinstance(sources, dict):

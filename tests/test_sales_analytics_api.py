@@ -257,11 +257,12 @@ def test_sales_audit_frontend_adapter_endpoints_return_report_arrays(tmp_path, m
                         "channel": "whatsapp",
                         "manager_id": "8",
                         "manager_name": "",
+                        "deal_stage_semantic_id": "P",
                     },
-                    {"interaction_id": "call-1", "channel": "call"},
+                    {"interaction_id": "call-1", "channel": "call", "deal_stage_semantic_id": "P"},
                 ],
                 "urgent_alerts": [
-                    {"deal_id": "777", "manager_id": "8", "trigger_type": "response_sla"},
+                    {"deal_id": "777", "manager_id": "8", "trigger_type": "response_sla", "deal_stage_semantic_id": "P"},
                 ],
             }
 

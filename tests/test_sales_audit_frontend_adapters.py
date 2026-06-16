@@ -3,6 +3,7 @@ from __future__ import annotations
 from bitrix_ingest.application.sales_audit.frontend_adapters import (
     build_frontend_sales_audit_data,
     enrich_frontend_deal_urls,
+    filter_frontend_sales_audit_in_work_sections,
 )
 from bitrix_ingest.application.sales_audit.report_builder import build_sales_audit_report
 
@@ -98,6 +99,8 @@ def test_frontend_adapter_builds_interaction_index_and_urgent_alerts() -> None:
             missing_next_step=True,
         ),
         _feature(source_type="call", source_id="101", deal_id="555"),
+        _feature(source_type="whatsapp", source_id="888", deal_id="888"),
+        _feature(source_type="call", source_id="202", deal_id="999"),
     ]
     report = {
         "task_status": {
@@ -108,6 +111,13 @@ def test_frontend_adapter_builds_interaction_index_and_urgent_alerts() -> None:
                     "manager_name": "Alice",
                     "active_task_count": 0,
                     "overdue_task_count": 1,
+                },
+                {
+                    "deal_id": "888",
+                    "manager_id": "8",
+                    "manager_name": "Alice",
+                    "active_task_count": 0,
+                    "overdue_task_count": 0,
                 }
             ]
         }
@@ -125,6 +135,18 @@ def test_frontend_adapter_builds_interaction_index_and_urgent_alerts() -> None:
             "ASSIGNED_BY_ID": "8",
             "STAGE_SEMANTIC_ID": "P",
         },
+        {
+            "ID": "888",
+            "TITLE": "Lost deal",
+            "ASSIGNED_BY_ID": "8",
+            "STAGE_SEMANTIC_ID": "F",
+        },
+        {
+            "ID": "999",
+            "TITLE": "Won deal",
+            "ASSIGNED_BY_ID": "8",
+            "STAGE_SEMANTIC_ID": "S",
+        },
     ]
 
     data = build_frontend_sales_audit_data(
@@ -135,6 +157,7 @@ def test_frontend_adapter_builds_interaction_index_and_urgent_alerts() -> None:
     )
 
     assert len(data["interaction_index"]) == 2
+    assert {row["deal_id"] for row in data["interaction_index"]} == {"777", "555"}
     whatsapp = data["whatsapp_interactions"][0]
     assert whatsapp["channel"] == "whatsapp"
     assert whatsapp["deal_title"] == "Оптовая заявка"
@@ -144,6 +167,7 @@ def test_frontend_adapter_builds_interaction_index_and_urgent_alerts() -> None:
 
     alert = data["urgent_alerts"][0]
     assert alert["deal_id"] == "777"
+    assert {row["deal_id"] for row in data["urgent_alerts"]} == {"777"}
     assert alert["deal_url"] == "https://example.bitrix24.kz/crm/deal/details/777/"
     assert {trigger["type"] for trigger in alert["triggers"]} == {
         "response_sla",
@@ -228,6 +252,34 @@ def test_frontend_adapter_rewrites_legacy_default_deal_urls() -> None:
     assert enriched["alerts_dashboard"]["rows"][0]["crm_url"] == "https://tenant.bitrix24.kz/crm/deal/details/777/"
 
 
+def test_frontend_adapter_filters_saved_frontend_sections_to_in_work_deals() -> None:
+    report = {
+        "interaction_index": [
+            {"deal_id": "1", "channel": "whatsapp", "deal_stage_semantic_id": "P"},
+            {"deal_id": "2", "channel": "call", "deal_stage_semantic_id": "F"},
+            {"deal_id": "3", "channel": "whatsapp", "deal_stage_semantic_id": "S"},
+            {"deal_id": "4", "channel": "call", "active_as_of_to": 1},
+        ],
+        "whatsapp_interactions": [{"deal_id": "3"}],
+        "call_interactions": [{"deal_id": "2"}],
+        "urgent_alerts": [
+            {"deal_id": "1", "deal_stage_semantic_id": "P"},
+            {"deal_id": "2", "deal_stage_semantic_id": "F"},
+            {"deal_id": "5"},
+        ],
+        "alerts_dashboard": {"rows": [{"deal_id": "2"}]},
+        "task_status": {"deals": [{"deal_id": "5"}]},
+    }
+
+    filtered = filter_frontend_sales_audit_in_work_sections(report)
+
+    assert [row["deal_id"] for row in filtered["interaction_index"]] == ["1", "4"]
+    assert [row["deal_id"] for row in filtered["whatsapp_interactions"]] == ["1"]
+    assert [row["deal_id"] for row in filtered["call_interactions"]] == ["4"]
+    assert [row["deal_id"] for row in filtered["urgent_alerts"]] == ["1", "5"]
+    assert filtered["alerts_dashboard"]["rows"] == filtered["urgent_alerts"]
+
+
 def test_sales_audit_report_includes_frontend_arrays() -> None:
     report = build_sales_audit_report(
         executive_report={},
@@ -240,7 +292,7 @@ def test_sales_audit_report_includes_frontend_arrays() -> None:
         sales_quality_features=[
             _feature(source_type="whatsapp", source_id="777", deal_id="777"),
         ],
-        scope_deals=[{"ID": "777", "TITLE": "Оптовая заявка"}],
+        scope_deals=[{"ID": "777", "TITLE": "Оптовая заявка", "STAGE_SEMANTIC_ID": "P"}],
         portal_base_url="https://example.bitrix24.kz",
     )
 
