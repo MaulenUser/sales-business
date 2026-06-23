@@ -1,0 +1,24 @@
+name: Deploy Backend
+
+on:
+  push:
+    branches:
+      - prod/test
+
+concurrency:
+  group: sales-auditor-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy backend over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SALES_AUDITOR_HOST }}
+          username: ${{ secrets.SALES_AUDITOR_USER }}
+          key: ${{ secrets.SALES_AUDITOR_SSH_KEY }}
+          script: |
+            /opt/ai-auditor/deploy.sh backend
