@@ -77,6 +77,13 @@ def build_frontend_sales_audit_data(
         portal_base_url,
         manager_names=manager_names,
     )
+    all_interactions = build_interaction_index(
+        features=features,
+        deal_index=deal_index,
+        portal_base_url=portal_base_url,
+        manager_names=manager_names,
+        in_work_only=False,
+    )
     interactions = build_interaction_index(
         features=features,
         deal_index=deal_index,
@@ -102,6 +109,12 @@ def build_frontend_sales_audit_data(
             "rows": urgent_alerts,
             "source": "sales_quality_features + sales_analytics_tasks",
         },
+        "dashboard_rankings": build_dashboard_rankings(
+            interactions=all_interactions,
+            report=report,
+            scope_deals=scope_deals or [],
+            deal_index=deal_index,
+        ),
     }
 
 
@@ -111,6 +124,7 @@ def build_interaction_index(
     deal_index: dict[str, dict[str, Any]] | None = None,
     portal_base_url: str = "",
     manager_names: dict[str, str] | None = None,
+    in_work_only: bool = True,
 ) -> list[dict[str, Any]]:
     """Flatten sales-quality features into rows for calls and WhatsApp tables."""
     deal_index = deal_index or {}
@@ -127,9 +141,28 @@ def build_interaction_index(
             for feature in features
             if isinstance(feature, dict)
         )
-        if _is_in_work_deal(row)
+        if not in_work_only or _is_in_work_deal(row)
     ]
     return sorted(rows, key=lambda row: _timestamp(row.get("created_at")), reverse=True)
+
+
+def build_dashboard_rankings(
+    *,
+    interactions: list[dict[str, Any]],
+    report: dict[str, Any],
+    scope_deals: list[dict[str, Any]],
+    deal_index: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Build dashboard-only ratings from AI communication and CRM source data."""
+    return {
+        "request_stats": _build_request_stats(interactions),
+        "failure_stats": _build_failure_stats(
+            interactions=interactions,
+            report=report,
+            deal_index=deal_index,
+        ),
+        "successful_sources": _build_successful_sources(scope_deals),
+    }
 
 
 def filter_frontend_sales_audit_in_work_sections(report: dict[str, Any]) -> dict[str, Any]:
@@ -284,6 +317,143 @@ def build_urgent_alerts(
     )
 
 
+def _build_request_stats(interactions: list[dict[str, Any]]) -> dict[str, Any]:
+    buckets: dict[str, dict[str, Any]] = {}
+    for row in interactions:
+        if row.get("non_sales_interaction"):
+            continue
+        label = _request_label(row)
+        key = _bucket_key(label)
+        item = buckets.setdefault(
+            key,
+            {
+                "key": key,
+                "label": label,
+                "count": 0,
+                "channels": {},
+                "examples": [],
+            },
+        )
+        item["count"] += 1
+        channel = _clean(row.get("channel")) or "unknown"
+        item["channels"][channel] = _int(item["channels"].get(channel)) + 1
+        if len(item["examples"]) < 3:
+            item["examples"].append(
+                {
+                    "interaction_id": row.get("interaction_id") or "",
+                    "deal_id": row.get("deal_id") or "",
+                    "deal_title": row.get("deal_title") or "",
+                    "client_request": row.get("client_request") or row.get("summary") or "",
+                    "channel": channel,
+                }
+            )
+    rows = sorted(buckets.values(), key=lambda item: (-_int(item.get("count")), str(item.get("label") or "")))
+    total = sum(_int(row.get("count")) for row in rows)
+    for row in rows:
+        row["rate"] = _pct(_int(row.get("count")), total)
+    return {
+        "source": "sales_quality_features.client_request",
+        "total_requests": total,
+        "rows": rows[:10],
+    }
+
+
+def _build_failure_stats(
+    *,
+    interactions: list[dict[str, Any]],
+    report: dict[str, Any],
+    deal_index: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    buckets: dict[str, dict[str, Any]] = {}
+    counted_deals: set[str] = set()
+
+    for card in report.get("failed_deal_reanimation", {}).get("cards") or []:
+        if not isinstance(card, dict):
+            continue
+        reason = _failure_card_label(card)
+        deal_id = _clean(card.get("deal_id"))
+        _add_failure_bucket(
+            buckets,
+            reason,
+            deal_id=deal_id,
+            deal_title=_clean(card.get("deal_title")),
+            evidence=_clean(card.get("failure_reason") or card.get("failure_comment") or " ".join(card.get("reason_signals") or [])),
+            source="failed_deal_reanimation",
+        )
+        if deal_id:
+            counted_deals.add(deal_id)
+
+    for row in interactions:
+        deal_id = _clean(row.get("deal_id"))
+        deal = deal_index.get(deal_id, {})
+        if not deal_id or deal_id in counted_deals or not _is_failed_deal({**deal, **row}):
+            continue
+        reason = _failure_interaction_label(row)
+        _add_failure_bucket(
+            buckets,
+            reason,
+            deal_id=deal_id,
+            deal_title=_clean(row.get("deal_title")),
+            evidence=_clean(row.get("client_request") or row.get("summary")),
+            source="sales_quality_features.last_interactions",
+        )
+        counted_deals.add(deal_id)
+
+    rows = sorted(buckets.values(), key=lambda item: (-_int(item.get("count")), str(item.get("label") or "")))
+    total = len(counted_deals) or sum(_int(row.get("count")) for row in rows)
+    for row in rows:
+        row["rate"] = _pct(_int(row.get("count")), total)
+    return {
+        "source": "ai_failure_reasons_from_last_interactions",
+        "manager_declared_reasons_trusted": False,
+        "failed_deals_analyzed": total,
+        "rows": rows[:10],
+    }
+
+
+def _build_successful_sources(scope_deals: list[dict[str, Any]]) -> dict[str, Any]:
+    buckets: dict[str, dict[str, Any]] = {}
+    for deal in scope_deals:
+        if not isinstance(deal, dict) or not _is_successful_deal(deal):
+            continue
+        label = _deal_source_label(deal)
+        key = _bucket_key(label)
+        item = buckets.setdefault(
+            key,
+            {
+                "key": key,
+                "label": label,
+                "count": 0,
+                "amount": 0.0,
+                "examples": [],
+            },
+        )
+        item["count"] += 1
+        item["amount"] += _num(deal.get("OPPORTUNITY") or deal.get("opportunity"))
+        if len(item["examples"]) < 3:
+            item["examples"].append(
+                {
+                    "deal_id": _clean(deal.get("ID") or deal.get("id") or deal.get("deal_id")),
+                    "deal_title": _clean(deal.get("TITLE") or deal.get("title") or deal.get("deal_title")),
+                    "source_id": _clean(deal.get("SOURCE_ID") or deal.get("source_id")),
+                    "source_description": _clean(deal.get("SOURCE_DESCRIPTION") or deal.get("source_description")),
+                }
+            )
+    rows = sorted(
+        buckets.values(),
+        key=lambda item: (-_int(item.get("count")), -_num(item.get("amount")), str(item.get("label") or "")),
+    )
+    total = sum(_int(row.get("count")) for row in rows)
+    for row in rows:
+        row["amount"] = round(_num(row.get("amount")), 2)
+        row["rate"] = _pct(_int(row.get("count")), total)
+    return {
+        "source": "crm_deal_successful_sources",
+        "successful_deals": total,
+        "rows": rows[:10],
+    }
+
+
 def _interaction_row(
     feature: dict[str, Any],
     *,
@@ -373,6 +543,124 @@ def _interaction_triggers(row: dict[str, Any]) -> list[dict[str, Any]]:
     if str(row.get("need_identified") or "").lower() != "yes" and str(row.get("manager_presented_service") or "").lower() == "yes":
         triggers.append(_trigger("no_need_identified", "Менеджер перешел к презентации до выявления потребности клиента."))
     return triggers
+
+
+def _request_label(row: dict[str, Any]) -> str:
+    tags = [str(item).strip() for item in row.get("tags") or row.get("labels") or [] if str(item).strip()]
+    for value in [
+        row.get("primary_topic"),
+        tags[0] if tags else "",
+        row.get("client_request"),
+        row.get("summary"),
+    ]:
+        text = _clean(value)
+        if text:
+            return _trim_label(text)
+    return "Запрос не распознан"
+
+
+def _failure_card_label(card: dict[str, Any]) -> str:
+    for value in [
+        card.get("failure_category"),
+        card.get("failure_reason_type"),
+        card.get("reason_type"),
+        card.get("reason_bucket"),
+        card.get("failure_reason"),
+        card.get("failure_comment"),
+    ]:
+        text = _clean(value)
+        if text:
+            return _trim_label(text)
+    signals = [str(item).strip() for item in card.get("reason_signals") or [] if str(item).strip()]
+    return _trim_label(signals[0]) if signals else "Причина не распознана"
+
+
+def _failure_interaction_label(row: dict[str, Any]) -> str:
+    if row.get("non_sales_interaction"):
+        return "Нецелевой лид"
+    if row.get("manager_asked_questions") == "no":
+        return "Менеджер не выявил потребность"
+    if row.get("need_identified") != "yes" and row.get("manager_presented_service") == "yes":
+        return "Презентация до выявления потребности"
+    if row.get("manager_agreed_next_step") != "yes":
+        return "Нет следующего шага"
+    return _request_label(row)
+
+
+def _add_failure_bucket(
+    buckets: dict[str, dict[str, Any]],
+    label: str,
+    *,
+    deal_id: str,
+    deal_title: str,
+    evidence: str,
+    source: str,
+) -> None:
+    key = _bucket_key(label)
+    item = buckets.setdefault(
+        key,
+        {
+            "key": key,
+            "label": label,
+            "count": 0,
+            "examples": [],
+            "sources": {},
+        },
+    )
+    item["count"] += 1
+    item["sources"][source] = _int(item["sources"].get(source)) + 1
+    if len(item["examples"]) < 3:
+        item["examples"].append(
+            {
+                "deal_id": deal_id,
+                "deal_title": deal_title,
+                "evidence": evidence,
+            }
+        )
+
+
+def _deal_source_label(deal: dict[str, Any]) -> str:
+    source_id = _clean(deal.get("SOURCE_ID") or deal.get("source_id"))
+    source_description = _clean(deal.get("SOURCE_DESCRIPTION") or deal.get("source_description"))
+    utm_source = _clean(deal.get("UTM_SOURCE") or deal.get("utm_source"))
+    title = _clean(deal.get("TITLE") or deal.get("title"))
+    for value in (source_description, utm_source, source_id):
+        if value:
+            return _trim_label(value)
+    hash_tag = next((part for part in title.split() if part.startswith("#") and len(part) > 1), "")
+    if hash_tag:
+        return _trim_label(hash_tag)
+    return "Источник не указан"
+
+
+def _is_successful_deal(row: dict[str, Any]) -> bool:
+    semantic = _clean(row.get("STAGE_SEMANTIC_ID") or row.get("stage_semantic_id")).upper()
+    if semantic:
+        return semantic == "S"
+    status = _clean(row.get("status_bucket") or row.get("STATUS_BUCKET")).lower()
+    if status:
+        return status in {"won", "success", "successful"}
+    won = _maybe_bool(row.get("won") or row.get("WON"))
+    return bool(won)
+
+
+def _is_failed_deal(row: dict[str, Any]) -> bool:
+    semantic = _clean(row.get("deal_stage_semantic_id") or row.get("stage_semantic_id") or row.get("STAGE_SEMANTIC_ID")).upper()
+    if semantic:
+        return semantic == "F"
+    status = _clean(row.get("status_bucket") or row.get("STATUS_BUCKET")).lower()
+    return status in {"failed", "lost"}
+
+
+def _bucket_key(value: str) -> str:
+    return " ".join(_clean(value).lower().split()) or "unknown"
+
+
+def _trim_label(value: str, limit: int = 96) -> str:
+    text = " ".join(_clean(value).split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
 
 
 def _task_deal_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
@@ -798,6 +1086,12 @@ def _num(value: Any) -> float:
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _pct(count: int | float, total: int | float) -> float:
+    c = _num(count)
+    t = _num(total)
+    return round(c / t * 100, 1) if t else 0.0
 
 
 def _maybe_bool(value: Any) -> bool | None:

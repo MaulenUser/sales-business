@@ -301,3 +301,63 @@ def test_sales_audit_report_includes_frontend_arrays() -> None:
     assert report["call_interactions"] == []
     assert report["alerts_dashboard"]["rows"] == report["urgent_alerts"]
     assert report["sales_audit_sources"]["portal_base_url"] == "https://example.bitrix24.kz"
+
+
+def test_sales_audit_report_includes_dashboard_rankings() -> None:
+    report = build_sales_audit_report(
+        executive_report={
+            "failed_deal_reanimation": {
+                "cards": [
+                    {
+                        "deal_id": "888",
+                        "deal_title": "Lost deal",
+                        "failure_category": "Нет следующего шага",
+                        "failure_reason": "Клиенту не предложили следующий контакт",
+                    }
+                ]
+            }
+        },
+        sales_report={
+            "run_id": "run-1",
+            "tenant_id": "tenant",
+            "deal_dashboard": {"department": {"failed_count": 1}},
+            "task_status": {"department": {}, "deals": []},
+        },
+        sales_quality_features=[
+            _feature(source_type="whatsapp", source_id="777", deal_id="777"),
+            _feature(
+                source_type="call",
+                source_id="888",
+                deal_id="888",
+                need_identified="no",
+                next_step_status="none",
+                missing_next_step=True,
+            ),
+        ],
+        scope_deals=[
+            {
+                "ID": "777",
+                "TITLE": "Won deal #instagram",
+                "OPPORTUNITY": 120000,
+                "SOURCE_ID": "CALL",
+                "SOURCE_DESCRIPTION": "Звонки",
+                "STAGE_SEMANTIC_ID": "S",
+            },
+            {
+                "ID": "888",
+                "TITLE": "Lost deal",
+                "STAGE_SEMANTIC_ID": "F",
+            },
+        ],
+    )
+
+    rankings = report["dashboard_rankings"]
+
+    assert rankings["request_stats"]["total_requests"] == 2
+    assert rankings["request_stats"]["rows"][0]["label"] == "цена"
+    assert rankings["failure_stats"]["manager_declared_reasons_trusted"] is False
+    assert rankings["failure_stats"]["failed_deals_analyzed"] == 1
+    assert rankings["failure_stats"]["rows"][0]["label"] == "Нет следующего шага"
+    assert rankings["successful_sources"]["successful_deals"] == 1
+    assert rankings["successful_sources"]["rows"][0]["label"] == "Звонки"
+    assert rankings["successful_sources"]["rows"][0]["amount"] == 120000
